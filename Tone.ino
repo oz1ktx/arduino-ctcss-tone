@@ -1,16 +1,69 @@
 #include <Wire.h>
+#include <avr/io.h>
+#include <avr/interrupt.h>
 
 const uint8_t num_samples = 100;
-const uint8_t prescaler_1    = 0b001;
-const uint8_t prescaler_8    = 0b010;
-const uint8_t prescaler_64   = 0b011;
-const uint8_t prescaler_256  = 0b100;
-const uint8_t prescaler_1024 = 0b101;
 
 uint8_t counter = 0;
 String frq_str;
 float frequency;
 bool update;
+
+/** Set up Timer1 for a given frequency (Hz)
+ Returns true if the frequency could be configured, false otherwise.
+*/
+bool timer1_setFrequency(uint32_t freqHz)
+{
+  // ----- 1. Choose prescaler -------------------------------------------------
+  const struct {
+    uint16_t prescale;
+    uint8_t csBits;          // CS12..CS10 bits for TCCR1B
+  } presc[] = {
+    {1,    (1 << CS10)},
+    {8,    (1 << CS11)},
+    {64,   (1 << CS11) | (1 << CS10)},
+    {256,  (1 << CS12)},
+    {1024, (1 << CS12) | (1 << CS10)}
+  };
+
+  uint16_t chosenPrescale = 0;
+  uint8_t   csBits = 0;
+  uint16_t ocr = 0;
+
+  for (uint8_t i = 0; i < sizeof(presc)/sizeof(presc[0]); ++i) {
+    // compute OCR value for this prescaler
+    uint32_t tmp = (F_CPU / (presc[i].prescale * (uint64_t)freqHz)) - 1UL;
+    // fits in 16‑bit?
+    if (tmp <= 0xFFFF) {
+      chosenPrescale = presc[i].prescale;
+      csBits = presc[i].csBits;
+      ocr = (uint16_t)tmp;
+      // take the first (smallest) prescaler that works
+      break;
+    }
+  }
+
+  if (chosenPrescale == 0) return false;   // frequency out of range
+
+  // ----- 2. Stop timer while we reconfigure ---------------------------------
+  TCCR1B = 0;                     // no clock source → timer stopped
+
+  // ----- 3. Set CTC mode (WGM12 = 1) -----------------------------------------
+  TCCR1A = 0;                     // normal port operation
+  TCCR1B = (1 << WGM12);          // CTC mode, keep CS bits cleared for now
+
+  // ----- 4. Load compare register ---------------------------------------------
+  OCR1A = ocr;                    // value we calculated above
+
+  // ----- 5. Enable interrupt -------------------------------------------------
+  TIMSK1 = (1 << OCIE1A);         // Output‑Compare‑A Match Interrupt Enable
+
+  // ----- 6. Start timer with selected prescaler -------------------------------
+  TCCR1B |= csBits;               // start counting
+
+  return true;
+}
+
 
 const uint8_t samples[num_samples] = {
   127, 135, 143, 151, 159, 166, 174, 181, 188, 195, 202, 208, 214, 220,
@@ -22,41 +75,22 @@ const uint8_t samples[num_samples] = {
   59, 66, 73, 80, 88, 95, 103, 111, 119
 };
 
-uint16_t calc_ocr1a(float frq)
-{
-  float result = 16e6 / (frq*1.0*num_samples) - 1;
-  Serial.println(result);
-  return round(result);
-}
-
-void set_frq(float frq) {
-  OCR1A = calc_ocr1a(frq);
-  Serial.println(OCR1A);
+bool set_frq(float frq) {
+  return timer1_setFrequency(100*frq);
 }
 
 ISR(TIMER1_COMPA_vect)
 {
   PORTD = samples[counter++];
   counter %= num_samples;
-  TCNT1 = 0;
 }
 
 void setup() {
+  // set all port D to output
+  DDRD = 0xFF;
   Serial.begin(9600);
   Serial.println("Start");
-  //set pins as outputs
-  DDRD = B11111111;
-  cli();//stop interrupts
-  // set timer 1 control register
-  TCCR1B = 0;
-  TCCR1A = 0;
-  TCCR1B |= prescaler_1;
-  TCNT1 = 0;
-  TIMSK1 |= 0b00000010; // set OCIE1A to 1 = enable compare match A
-  // set initial frequency
-  OCR1A = calc_ocr1a(5000);
-
-  sei();//allow interrupts
+  timer1_setFrequency(100*100);
   update = false;
 }
 
@@ -85,8 +119,12 @@ void loop() {
   delay(100);
   check_input();
   if (update) {
-    Serial.println(frequency);
-    set_frq(frequency);
+    Serial.print("Trying to set frequency "); Serial.println(frequency);
+    if (set_frq(frequency)) {
+      Serial.println("Success");
+    } else {
+      Serial.println("Out of range");
+    }
     update = false;
   }
 }
